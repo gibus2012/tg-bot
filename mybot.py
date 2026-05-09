@@ -1,294 +1,176 @@
-import logging
+import asyncio
 import sqlite3
 import json
-import requests
-from aiogram import Bot, Dispatcher, F, Router
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-# --- НАСТРОЙКИ (ЗАПОЛНИ СВОИ ДАННЫЕ) ---
-TOKEN = '7684953787:AAEcIMd1i9POTUPa7ZuIeejoYE70X3wAv7U'
-PROXY_API_KEY = 'sk-zq9qY2WopXj3tsYpMLil7VV98RGlOm9M'
-ADMIN_ID = 6760835730  # Ваш Telegram ID
-CHANNEL_ID = "@NorkaGpt" # Замени на свой
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from openai import AsyncOpenAI
 
-BASE_URL = "https://api.proxyapi.ru/openai/v1/chat/completions"
-IMG_URL = "https://api.proxyapi.ru/openai/v1/images/generations"
+# --- НАСТРОЙКИ ---
+TOKEN = "7684953787:AAEcIMd1i9POTUPa7ZuIeejoYE70X3wAv7U"
+OPENAI_KEY = "sk-zq9qY2WopXj3tsYpMLil7VV98RGlOm9M"
+ADMIN_ID = 6760835730  # Ваш ID
+CHANNEL_ID = -1003921488947 # ID канала для проверки подписки
+CHANNEL_URL = "https://t.me/NorkaGpt"
+CARD_NUMBER = "2202 2082 6287 3053"
 
-logging.basicConfig(level=logging.INFO)
+# Если используете прокси, добавьте base_url
+client = AsyncOpenAI(
+    api_key=OPENAI_KEY, 
+    base_url="https://api.proxy-provider.com/v1" # Ссылка от вашего прокси-сервиса
+) 
 bot = Bot(token=TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
+dp = Dispatcher()
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+# --- БАЗА ДАННЫХ ---
 def init_db():
-    conn = sqlite3.connect('/data/users.db')
+    conn = sqlite3.connect("bot_final.db")
     cursor = conn.cursor()
-    # Добавляем колонки для рефералов и подписки
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                      (id INTEGER PRIMARY KEY,
-                       balance INTEGER, 
-                       model TEXT,
-                       history TEXT, 
-                       is_premium INTEGER DEFAULT 0, 
-                       referrer_id INTEGER, 
-                       is_rewarded INTEGER DEFAULT 0, 
-                       sub_rewarded INTEGER DEFAULT 0)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER DEFAULT 10,
+        is_premium INTEGER DEFAULT 0,
+        last_reset TEXT,
+        history TEXT DEFAULT '[]',
+        referrer_id INTEGER,
+        ref_reward_given INTEGER DEFAULT 0,
+        sub_reward_given INTEGER DEFAULT 0,
+        img_today INTEGER DEFAULT 0
+    )''')
     conn.commit()
     conn.close()
 
-def get_user(user_id):
-    conn = sqlite3.connect('/data/users.db')
+def get_user(user_id, referrer_id=None):
+    conn = sqlite3.connect("bot_final.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id=?", (user_id,))
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
+    today = datetime.now().strftime("%Y-%m-%d")
+
     if not user:
-        cursor.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (user_id, 10, "-4o-mini", "[]", 0, None, 0, 0))
+        cursor.execute("INSERT INTO users (user_id, last_reset, referrer_id) VALUES (?, ?, ?)", 
+                       (user_id, today, referrer_id))
         conn.commit()
-        user = (user_id, 10, "-4o-mini", "[]", 0)
+        return get_user(user_id)
+    
+    # СБРОС ЛИМИТОВ КАЖДЫЙ ДЕНЬ
+    if user[3] != today:
+        daily_balance = 50 if user[2] == 1 else 10
+        cursor.execute("UPDATE users SET balance = ?, img_today = 0, last_reset = ? WHERE user_id = ?", 
+                       (daily_balance, today, user_id))
+        conn.commit()
+        return get_user(user_id)
+
     conn.close()
     return user
 
-def update_user(user_id, balance=None, model=None, history=None, is_premium=None):
-    conn = sqlite3.connect('/data/users.db')
+def update_db(user_id, column, value):
+    conn = sqlite3.connect("bot_final.db")
     cursor = conn.cursor()
-    if balance is not None:
-        cursor.execute("UPDATE users SET balance=? WHERE id=?", (balance, user_id))
-    if model is not None:
-        cursor.execute("UPDATE users SET model=? WHERE id=?", (model, user_id))
-    if history is not None:
-        cursor.execute("UPDATE users SET history=? WHERE id=?", (history, user_id))
-    if is_premium is not None:
-        cursor.execute("UPDATE users SET is_premium=? WHERE id=?", (is_premium, user_id))
+    cursor.execute(f"UPDATE users SET {column} = ? WHERE user_id = ?", (value, user_id))
     conn.commit()
     conn.close()
 
-# --- КЛАВИАТУРЫ ---
-def main_menu():
-    # В aiogram 3.x кнопки передаются списком внутри аргумента keyboard
-    kb = [
-        [KeyboardButton(text="🧠  Задать вопрос"), KeyboardButton(text="🎨  Создать фото")],
-        [KeyboardButton(text="⚙️  Настройки"), KeyboardButton(text="💰 Купить Premium")],
-        [KeyboardButton(text="🎁  Бесплатные запросы")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-
-def settings_menu(is_premium):
-    status = "🌟  Premium" if is_premium else "Бесплатный"
-    
-    # В aiogram 3.x кнопки передаются списком внутри аргумента inline_keyboard
-    buttons = [
-        [InlineKeyboardButton(text=f"Ваш статус: {status}", callback_data="none")],
-        [InlineKeyboardButton(text="Выбрать GPT-4o-mini", callback_data="set_model_-4o-mini")],
-        [InlineKeyboardButton(text="Выбрать GPT-4o (Premium)", callback_data="set_model_-4o")],
-        [InlineKeyboardButton(text="🗑 Очистить историю", callback_data="clear_history")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# --- КОМАНДЫ И ОБРАБОТЧИКИ ---
-@router.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    
-    # Если юзер зашел в бота ПЕРВЫЙ РАЗ
-    if not user:
-        referrer_id = None
-        # Проверяем, есть ли в ссылке ID пригласившего
-        if command.args and command.args.isdigit():
-            ref_candidate = int(command.args)
-            if ref_candidate != user_id: # Защита, чтобы не приглашал сам себя
-                referrer_id = ref_candidate
-        
-        # Создаем нового юзера в базе (добавляем referrer_id)
-        conn = sqlite3.connect('/data/users.db')
-        cursor = conn.cursor()
-        # ВАЖНО: Тут 8 знаков ?, так как мы добавили колонки в init_db
-        cursor.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-                       (user_id, 10, "-4o-mini", "[]", 0, referrer_id, 0, 0))
-        conn.commit()
-        conn.close()
-        
-        # Пишем тому, кто пригласил, что у него новый реферал
-        if referrer_id:
-            try:
-                await bot.send_message(referrer_id, "🤝  По вашей ссылке зашел новый друг! Вы получите +3 запроса, когда он напишет первое сообщение.")
-            except:
-                pass
-
-    # Обычное приветствие (как и было у тебя)
-    await message.answer(
-        "Привет! Я ИИ бот. У тебя есть 10 бесплатных запросов. Можешь задавать вопросы или создавать фото.", 
-        reply_markup=main_menu()
-    )
-
-@router.message(F.text(equals="💰 Купить Premium"))
-async def buy_premium(message: Message):
-    uid = message.from_user.id
-    text = (
-        f"🌟  **Преимущества Premium:**\n"
-        f"1. Доступ к самой умной модели GPT-4o\n"
-        f"2. Приоритетная скорость ответов\n"
-        f"3. +100 запросов на баланс\n\n"
-        f"**Цена:** 200 рублей.\n"
-        f"Для покупки переведи деньги на карту: `2202 2082 6287 3053`\n"
-        f"После оплаты скинь чек и свой ID: `{uid}` админу @zilowu"
-    )
-    await message.answer(text, parse_mode="Markdown")
-
-@router.message(F.text(equals="⚙️  Настройки"))
-async def open_settings(message: Message):
-    user = get_user(message.from_user.id)
-    await message.answer(
-        f"⚙️  **Настройки**\n\nБаланс: {user[1]} запросов\nМодель: {user[2]}",
-        reply_markup=settings_menu(user[4]),
-        parse_mode="Markdown"
-    )
-
-@router.callback_query(F.data.startswith('set_model_'))
-async def change_model(callback: CallbackQuery):
-    user = get_user(callback.from_user.id)
-    requested_model = callback.data.split('_')[2]
-
-    if requested_model == "-4o" and not user[4]:
-        await callback.answer("❌ GPT-4.0 доступна только для Premium пользователей!", show_alert=True)
-        return
-
-    update_user(callback.from_user.id, model=requested_model)
-    await callback.answer(f"✅ Модель {requested_model} установлена")
-    await callback.message.edit_text(f"✅ Модель изменена на {requested_model}. Теперь пиши сообщение!")
-
-@router.callback_query(F.data == 'clear_history')
-async def clear_history(callback: CallbackQuery):
-    update_user(callback.from_user.id, history="[]")
-    await callback.answer("🗑 История очищена!")
-
-@router.message(Command('set_premium'))
-async def admin_set_premium(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    args = message.get_args()
-    if not args:
-        await message.answer("Ошибка! Пиши: /set_premium ID_ПОЛЬЗОВАТЕЛЯ")
-        return
-
+# --- ПРОВЕРКА ПОДПИСКИ ---
+async def is_subscribed(user_id):
     try:
-        target_id = int(args)
-        update_user(target_id, is_premium=1, balance=100)
-        await message.answer(f"✅ Премиум выдан пользователю {target_id}!")
-        await bot.send_message(target_id, "🌟  Вам выдан Premium доступ! Теперь вы можете выбрать модель 4.0 в настройках.")
-    except Exception as e:
-        await message.answer(f"Ошибка! Проверь правильность ID. ({e})")
-@router.message(F.text == "🎁  Бесплатные запросы")
-async def free_bonus(message: Message):
-    user_id = message.from_user.id
-    bot_name = (await bot.get_me()).username
-    ref_link = f"https://t.me/{bot_name}?start={user_id}"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢  Подписаться", url=f"https://t.me/{CHANNEL_ID[1:]}")],
-        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")]
-    ])
-    await message.answer(f"1. Подпишись на {CHANNEL_ID} (+1 запрос)\n2. Ссылка для друзей:\n`{ref_link}`", reply_markup=kb, parse_mode="Markdown")
+        m = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return m.status in ["member", "administrator", "creator"]
+    except: return False
 
-@router.callback_query(F.data == "check_sub")
-async def check_sub_handler(callback: CallbackQuery):
-    user = get_user(callback.from_user.id)
-    if user[7] == 1: # Колонка sub_rewarded
-        await callback.answer("Вы уже получили бонус!", show_alert=True)
-        return
+# --- КЛАВИАТУРА ---
+def main_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Баланс")
+    kb.button(text="Очистить историю")
+    kb.button(text="Купить Premium")
+    kb.button(text="Помощь")
+    kb.adjust(2)
+    return kb.as_markup(resize_keyboard=True)
 
-    # Проверка статуса в канале
-    chat_member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=callback.from_user.id)
-    if chat_member.status != 'left':
-        update_user(callback.from_user.id, balance=user[1]+1, sub_rewarded=1)
-        await callback.message.answer("✅ +1 запрос начислен!")
-    else:
-        await callback.answer("❌ Вы не подписаны!", show_alert=True)
+# --- ОБРАБОТЧИКИ ---
 
-# --- ГЛАВНАЯ ЛОГИКА ---
-@router.message()
-async def main_handler(message: Message, state: FSMContext):
+@dp.message(Command("start"))
+async def start(message: types.Message, command: CommandObject):
+    ref_id = int(command.args) if command.args and command.args.isdigit() else None
+    get_user(message.from_user.id, ref_id)
+    await message.answer(f"Привет! Твой ID: `{message.from_user.id}`. Напиши 'нарисуй или сгенерируй' или просто задай вопрос.", 
+                         reply_markup=main_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "Баланс")
+async def balance(message: types.Message):
     user = get_user(message.from_user.id)
-    # ЛОГИКА НАГРАДЫ ЗА ДРУГА
-    # Если у юзера есть referrer_id и награда еще не была выдана (is_rewarded == 0)
-    if user[5] and user[6] == 0:
-        referrer_id = user[5]
-        ref_data = get_user(referrer_id)
-        if ref_data:
-            # Начисляем +3 тому, кто пригласил
-            update_user(referrer_id, balance=ref_data[1] + 3)
-            # Помечаем, что награда за этого приглашенного выдана
-            update_user(message.from_user.id, is_rewarded=1)
-            try: await bot.send_message(referrer_id, "🎁  Бонус! Ваш приглашенный друг активен, вам начислено +3 запроса!")
-            except: pass
-    balance, current_model, history_json, is_premium = user[1], user[2], user[3], user[4]
+    status = "Premium 👑" if user[2] else "Бесплатный"
+    await message.answer(f"📊 Статус: {status}\n💰 Запросы: {user[1]}\n🖼 Фото сегодня: {user[8]}/5")
 
-    if balance <= 0:
-        await message.answer("❌ Запросы закончились. Купите Premium или дождитесь пополнения.")
-        return
+@dp.message(F.text == "Купить Premium")
+async def buy(message: types.Message):
+    await message.answer(f"💳 Цена: 300 руб/мес\nЛимит: 50 зап/день + 5 фото.\nКарта: `{CARD_NUMBER}`\nПосле оплаты скинь скрин и ID администратору: @zilowu.")
 
-    # Генерация изображения
-    if any(word in message.text.lower() for word in ["нарисуй", "фото", "картинка"]):
-        await message.answer("⏳ Генерирую изображение...")
-        headers = {"Authorization": f"Bearer {PROXY_API_KEY}"}
-        payload = {"model": "dall-e-3", "prompt": message.text, "n": 1, "size": "1024x1024"}
+@dp.message(Command("give_premium"))
+async def adm(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    tid = int(message.text.split()[1])
+    update_db(tid, "is_premium", 1)
+    update_db(tid, "balance", 50)
+    await message.answer("Готово")
 
+@dp.message()
+async def handle_all(message: types.Message):
+    if not message.text: return
+    user = get_user(message.from_user.id)
+    text = message.text.lower()
+
+    # Начисление за реферала (при первом сообщении)
+    if user[6] == 0 and user[5]:
+        inviter = get_user(user[5])
+        update_db(inviter[0], "balance", inviter[1] + 3)
+        update_db(user[0], "ref_reward_given", 1)
+        try: await bot.send_message(inviter[0], "🎁 +3 запроса за друга!")
+        except: pass
+
+    # --- ЛОГИКА ГЕНЕРАЦИИ ФОТО ---
+    if text.startswith("нарисуй") or text.startswith("сгенерируй"):
+        if user[8] >= 5:
+            return await message.answer("❌ Лимит 5 фото в день исчерпан.")
+        if user[1] < 5:
+            return await message.answer("❌ Нужно 5 запросов для фото.")
+        
+        prompt = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else ""
+        if not prompt: return await message.answer("Что нарисовать?")
+        
+        m = await message.answer("🎨 Рисую...")
         try:
-            r = requests.post(IMG_URL, json=payload, headers=headers).json()
-            photo_url = r['data'][0]['url']
-            await bot.send_photo(message.chat.id, photo_url, caption="Готово!")
-            update_user(message.from_user.id, balance=balance - 5)
-            return
-        except Exception as e:
-            await message.answer(f"Ошибка при создании фото: {e}")
-            return
+            res = await client.images.generate(model="dall-e-3", prompt=prompt)
+            await message.answer_photo(res.data[0].url)
+            update_db(user[0], "balance", user[1] - 5)
+            update_db(user[0], "img_today", user[8] + 1)
+        except Exception as e: await message.answer(f"Ошибка: {e}")
+        finally: await m.delete()
+        return
 
-    # Текстовый запрос к ИИ
+    # --- ЛОГИКА ЧАТА ---
+    if user[1] < 1:
+        return await message.answer("Запросы кончились.")
+
+    model = "-4o" if user[2] else "-4o-mini"
+    history = json.loads(user[4])
+    history.append({"role": "user", "content": message.text})
+    history = history[-10:]
+
     try:
-        history = json.loads(history_json)
-        history.append({"role": "user", "content": message.text})
+        res = await client.chat.completions.create(model=model, messages=history)
+        ans = res.choices[0].message.content
+        history.append({"role": "assistant", "content": ans})
+        update_db(user[0], "history", json.dumps(history))
+        if not user[2]: update_db(user[0], "balance", user[1] - 1)
+        await message.answer(ans)
+    except Exception as e: await message.answer(f"Ошибка: {e}")
 
-        payload = {
-            "model": current_model,
-            "messages": [{"role": "system", "content": "Ты полезный ассистент."}] + history[-10:],
-            "max_tokens": 1000,
-            "temperature": 0.7,
-            "top_p": 1,
-            "presence_penalty": 0,
-            "frequency_penalty": 0
-        }
-
-        headers = {"Authorization": f"Bearer {PROXY_API_KEY}"}
-
-        thinking_msg = await message.answer("🤔  Думаю...")
-
-        res = requests.post(BASE_URL, json=payload, headers=headers).json()
-
-        reply_text = res['choices'][0]['message']['content']
-
-        history.append({"role": "assistant", "content": reply_text})
-
-        update_user(
-            message.from_user.id,
-            balance=balance - 1,
-            history=json.dumps(history)
-        )
-
-        await thinking_msg.edit_text(reply_text)
-
-    except Exception as e:
-        await thinking_msg.edit_text(f"❌ Ошибка API. Проверьте баланс ProxyAPI. ({e})")
-
-# --- ЗАПУСК БОТА ---
-def main():
+async def main():
     init_db()
-    dp.include_router(router)
-    dp.run_polling(bot)
+    await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
